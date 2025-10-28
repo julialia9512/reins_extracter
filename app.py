@@ -173,6 +173,38 @@ def _find_table_root(soup):
         table = soup.select_one(".p-table")
     return table
 
+def _find_all_tables(soup):
+    """Find all tables and return them with their types (apartment/villa/unknown)"""
+    # Find all potential table containers
+    all_tables = soup.select(".p-table")
+    
+    apt_table = None
+    villa_table = None
+    
+    for table in all_tables:
+        # Get header cells to determine table type
+        header_cells = []
+        header_root = table.select_one(".p-table-header")
+        if header_root:
+            for h in header_root.select(".p-table-header-item"):
+                txt = _text_or_none(h)
+                if txt:
+                    header_cells.append(txt)
+        
+        # Check if it's a villa table by looking for villa-specific columns
+        villa_indicators = ["土地面積", "建物面積", "接道状況", "接道１"]
+        apt_indicators = ["専有面積", "建物名", "所在階", "管理費"]
+        
+        has_villa_cols = any(ind in " ".join(header_cells) for ind in villa_indicators)
+        has_apt_cols = any(ind in " ".join(header_cells) for ind in apt_indicators)
+        
+        if has_villa_cols and not villa_table:
+            villa_table = table
+        elif has_apt_cols and not apt_table:
+            apt_table = table
+    
+    return apt_table, villa_table
+
 # =========================
 # マンション/区分（既存系）
 # =========================
@@ -377,57 +409,152 @@ def parse_villa_html_to_df(html: str) -> pd.DataFrame:
 # =========================
 st.title("不動産テーブル：貼り付け → プレビュー → Excel")
 
-tab1, tab2, tab3 = st.tabs(["マンション / 区分", "戸建（ヴィラ）", "一括エクスポート"])
+# Initialize session state
+if 'tab1_df_apt' not in st.session_state:
+    st.session_state.tab1_df_apt = None
+if 'tab1_df_vil' not in st.session_state:
+    st.session_state.tab1_df_vil = None
+if 'tab2_df_apt' not in st.session_state:
+    st.session_state.tab2_df_apt = None
+if 'tab3_df_vil' not in st.session_state:
+    st.session_state.tab3_df_vil = None
+
+tab1, tab2, tab3, tab4 = st.tabs(["WEB全体から抽出", "マンション / 区分", "戸建（ヴィラ）", "一括エクスポート"])
 
 with tab1:
+    st.subheader("WEBページ全体から自動抽出")
+    st.markdown("**使い方:** ブラウザで対象ページを表示し、右クリック → 「ページのソースを表示」 → 全てをコピーして下記に貼り付け")
+    full_html = st.text_area("WEBページ全体のHTMLを貼り付け", height=300, key="full_html")
+    if st.button("テーブル抽出・プレビュー"):
+        if not full_html.strip():
+            st.warning("HTMLを貼り付けてください。")
+        else:
+            soup = BeautifulSoup(full_html, "lxml")
+            apt_table, villa_table = _find_all_tables(soup)
+            
+            if not apt_table and not villa_table:
+                st.error("❌ テーブルが見つかりませんでした。HTMLの構造を確認してください。")
+                st.session_state.tab1_df_apt = None
+                st.session_state.tab1_df_vil = None
+            else:
+                # Parse and store in session state
+                st.session_state.tab1_df_apt = parse_apartment_html_to_df(str(apt_table)) if apt_table else pd.DataFrame()
+                st.session_state.tab1_df_vil = parse_villa_html_to_df(str(villa_table)) if villa_table else pd.DataFrame()
+                
+                # Show what we found
+                info_msg = "✅ 検出されたテーブル: "
+                if apt_table:
+                    info_msg += "マンション/区分 "
+                if villa_table:
+                    info_msg += "戸建（ヴィラ）"
+                st.success(info_msg)
+                st.rerun()
+    
+    # Display stored data
+    if st.session_state.tab1_df_apt is not None or st.session_state.tab1_df_vil is not None:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### マンション/区分データ")
+            df_apt = st.session_state.tab1_df_apt
+            if df_apt is not None and not df_apt.empty:
+                st.success(f"{len(df_apt)}件のデータを抽出しました")
+                st.dataframe(df_apt, width='stretch', height=300)
+            else:
+                st.info("マンション/区分データは見つかりませんでした。")
+        
+        with col2:
+            st.markdown("#### 戸建（ヴィラ）データ")
+            df_vil = st.session_state.tab1_df_vil
+            if df_vil is not None and not df_vil.empty:
+                st.success(f"{len(df_vil)}件のデータを抽出しました")
+                st.dataframe(df_vil, width='stretch', height=300)
+            else:
+                st.info("戸建（ヴィラ）データは見つかりませんでした。")
+        
+        # Excelダウンロードボタン
+        df_apt = st.session_state.tab1_df_apt if st.session_state.tab1_df_apt is not None else pd.DataFrame()
+        df_vil = st.session_state.tab1_df_vil if st.session_state.tab1_df_vil is not None else pd.DataFrame()
+        
+        if not df_apt.empty or not df_vil.empty:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                if not df_apt.empty:
+                    df_apt.to_excel(writer, sheet_name="apartments", index=False)
+                if not df_vil.empty:
+                    df_vil.to_excel(writer, sheet_name="villas", index=False)
+            st.download_button(
+                label="📥 抽出データをExcelでダウンロード",
+                data=buffer.getvalue(),
+                file_name="extracted_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+with tab2:
     st.subheader("マンション / 区分（HTMLを貼り付け）")
     apt_html = st.text_area("ここにHTMLを貼り付け", height=240, key="apt_html")
     colp1, colp2 = st.columns(2)
     with colp1:
         if st.button("プレビュー（マンション）"):
-            df_apt = parse_apartment_html_to_df(apt_html)
-            st.dataframe(df_apt, width='stretch')
+            st.session_state.tab2_df_apt = parse_apartment_html_to_df(apt_html)
+            st.rerun()
     with colp2:
         if st.button("Excel ダウンロード（マンション）"):
-            df_apt = parse_apartment_html_to_df(apt_html)
-            if df_apt.empty:
-                st.warning("データが見つかりませんでした。HTMLを確認してください。")
-            else:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                    df_apt.to_excel(writer, sheet_name="apartments", index=False)
-                st.download_button(
-                    label="apartments.xlsx を保存",
-                    data=buffer.getvalue(),
-                    file_name="apartments.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            if st.session_state.tab2_df_apt is None:
+                st.session_state.tab2_df_apt = parse_apartment_html_to_df(apt_html)
+                st.rerun()
+    
+    if st.session_state.tab2_df_apt is not None:
+        df_apt = st.session_state.tab2_df_apt
+        if not df_apt.empty:
+            st.dataframe(df_apt, width='stretch')
+            
+            # Download button
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                df_apt.to_excel(writer, sheet_name="apartments", index=False)
+            st.download_button(
+                label="apartments.xlsx を保存",
+                data=buffer.getvalue(),
+                file_name="apartments.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.warning("データが見つかりませんでした。HTMLを確認してください。")
 
-with tab2:
+with tab3:
     st.subheader("戸建（ヴィラ）（HTMLを貼り付け）")
     villa_html = st.text_area("ここにHTMLを貼り付け", height=240, key="villa_html")
     colv1, colv2 = st.columns(2)
     with colv1:
         if st.button("プレビュー（戸建）"):
-            df_vil = parse_villa_html_to_df(villa_html)
-            st.dataframe(df_vil, width='stretch')
+            st.session_state.tab3_df_vil = parse_villa_html_to_df(villa_html)
+            st.rerun()
     with colv2:
         if st.button("Excel ダウンロード（戸建）"):
-            df_vil = parse_villa_html_to_df(villa_html)
-            if df_vil.empty:
-                st.warning("データが見つかりませんでした。HTMLを確認してください。")
-            else:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                    df_vil.to_excel(writer, sheet_name="villas", index=False)
-                st.download_button(
-                    label="villas.xlsx を保存",
-                    data=buffer.getvalue(),
-                    file_name="villas.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            if st.session_state.tab3_df_vil is None:
+                st.session_state.tab3_df_vil = parse_villa_html_to_df(villa_html)
+                st.rerun()
+    
+    if st.session_state.tab3_df_vil is not None:
+        df_vil = st.session_state.tab3_df_vil
+        if not df_vil.empty:
+            st.dataframe(df_vil, width='stretch')
+            
+            # Download button
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                df_vil.to_excel(writer, sheet_name="villas", index=False)
+            st.download_button(
+                label="villas.xlsx を保存",
+                data=buffer.getvalue(),
+                file_name="villas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.warning("データが見つかりませんでした。HTMLを確認してください。")
 
-with tab3:
+with tab4:
     st.subheader("マンション + 戸建 を1ファイルにまとめて出力")
     apt_html2 = st.text_area("マンションHTML", height=180, key="apt_html_bulk")
     villa_html2 = st.text_area("戸建HTML", height=180, key="villa_html_bulk")
