@@ -31,4 +31,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Google OAuth credentials (contains sensitive data)
+credentials.json
+client_secret*.json
+token.json
+
 

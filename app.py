@@ -2,10 +2,21 @@
 import re
 import io
 import os
+import json
 from datetime import datetime
 import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
+
+# Google Sheets integration (optional)
+try:
+    import gspread
+    from google.oauth2 import service_account
+    from google_auth_oauthlib.flow import Flow
+    import google.oauth2.credentials as google_creds
+    GOOGLE_SHEETS_AVAILABLE = True
+except ImportError:
+    GOOGLE_SHEETS_AVAILABLE = False
 
 st.set_page_config(page_title="REINS Extractor", layout="wide")
 
@@ -406,6 +417,79 @@ def parse_villa_html_to_df(html: str) -> pd.DataFrame:
     return df
 
 # =========================
+# Google Sheets Integration
+# =========================
+def upload_to_google_sheets(df, spreadsheet_id, sheet_name, credentials_json=None, use_oauth=False):
+    """
+    Upload a pandas DataFrame to Google Sheets.
+    
+    Args:
+        df: pandas DataFrame to upload
+        spreadsheet_id: Google Sheets spreadsheet ID (from URL)
+        sheet_name: Name of the sheet to write to
+        credentials_json: JSON string of Google credentials (service account or OAuth)
+        use_oauth: If True, treat credentials as OAuth. If False, treat as service account.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    if not GOOGLE_SHEETS_AVAILABLE:
+        return False, "gspread library not installed. Install with: pip install gspread google-auth"
+    
+    if df.empty:
+        return False, "DataFrame is empty"
+    
+    try:
+        # Parse credentials
+        if credentials_json:
+            if isinstance(credentials_json, str):
+                creds_dict = json.loads(credentials_json)
+            else:
+                creds_dict = credentials_json
+        else:
+            return False, "No credentials provided"
+        
+        # Authenticate based on credential type
+        if use_oauth or 'type' in creds_dict and creds_dict.get('type') == 'authorized_user':
+            # OAuth credentials (user login)
+            creds = google_creds.Credentials.from_authorized_user_info(creds_dict)
+            client = gspread.authorize(creds)
+        elif 'type' in creds_dict and creds_dict.get('type') == 'service_account':
+            # Service account credentials
+            creds = service_account.Credentials.from_service_account_info(creds_dict)
+            client = gspread.authorize(creds)
+        else:
+            # Try to detect: service account has 'private_key', OAuth has 'refresh_token'
+            if 'private_key' in creds_dict:
+                creds = service_account.Credentials.from_service_account_info(creds_dict)
+                client = gspread.authorize(creds)
+            elif 'refresh_token' in creds_dict:
+                creds = google_creds.Credentials.from_authorized_user_info(creds_dict)
+                client = gspread.authorize(creds)
+            else:
+                return False, "Unable to determine credential type. Please ensure credentials are valid."
+        
+        # Open spreadsheet
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        
+        # Create or get sheet
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+            # Clear existing data
+            worksheet.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            # Create new sheet
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=26)
+        
+        # Write data
+        worksheet.update([df.columns.values.tolist()] + df.values.tolist())
+        
+        return True, f"Successfully uploaded {len(df)} rows to Google Sheets!"
+    
+    except Exception as e:
+        return False, f"Error uploading to Google Sheets: {str(e)}"
+
+# =========================
 # UI
 # =========================
 
@@ -520,6 +604,48 @@ with tab1:
                 file_name="extracted_data.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            
+            # Google Sheets Upload Section
+            st.markdown("---")
+            st.markdown("#### 📊 Google Sheets にアップロード")
+            if GOOGLE_SHEETS_AVAILABLE:
+                # Try to get credentials from secrets first
+                credentials_json = None
+                try:
+                    if hasattr(st, 'secrets') and 'GOOGLE_CREDENTIALS' in st.secrets:
+                        credentials_json = st.secrets.GOOGLE_CREDENTIALS
+                except:
+                    pass
+                
+                if not credentials_json:
+                    st.info("Google Sheets を使用するには、Streamlit Secrets に GOOGLE_CREDENTIALS を設定するか、下記に JSON を貼り付けてください")
+                    credentials_input = st.text_area("Google Service Account JSON (省略可)", height=100, key="gs_creds_tab1")
+                    if credentials_input:
+                        try:
+                            credentials_json = json.loads(credentials_input)
+                        except:
+                            st.error("無効な JSON 形式です")
+                else:
+                    st.success("✅ Streamlit Secrets から認証情報を読み込みました")
+                
+                spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab1", 
+                                              help="スプレッドシート URL から取得: https://docs.google.com/spreadsheets/d/[SPREADSHEET_ID]/edit")
+                
+                if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab1") and spreadsheet_id and credentials_json:
+                    if not df_apt.empty:
+                        success, message = upload_to_google_sheets(df_apt, spreadsheet_id, "apartments", credentials_json)
+                        if success:
+                            st.success(f"✅ マンション/区分: {message}")
+                        else:
+                            st.error(f"❌ マンション/区分: {message}")
+                    if not df_vil.empty:
+                        success, message = upload_to_google_sheets(df_vil, spreadsheet_id, "villas", credentials_json)
+                        if success:
+                            st.success(f"✅ 戸建（ヴィラ）: {message}")
+                        else:
+                            st.error(f"❌ 戸建（ヴィラ）: {message}")
+            else:
+                st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
 
 with tab2:
     st.subheader("マンション / 区分（HTMLを貼り付け）")
@@ -550,6 +676,39 @@ with tab2:
                 file_name="apartments.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            
+            # Google Sheets Upload
+            st.markdown("---")
+            st.markdown("#### 📊 Google Sheets にアップロード")
+            if GOOGLE_SHEETS_AVAILABLE:
+                credentials_json = None
+                try:
+                    if hasattr(st, 'secrets') and 'GOOGLE_CREDENTIALS' in st.secrets:
+                        credentials_json = st.secrets.GOOGLE_CREDENTIALS
+                except:
+                    pass
+                
+                if not credentials_json:
+                    credentials_input = st.text_area("Google Service Account JSON (省略可)", height=100, key="gs_creds_tab2")
+                    if credentials_input:
+                        try:
+                            credentials_json = json.loads(credentials_input)
+                        except:
+                            st.error("無効な JSON 形式です")
+                else:
+                    st.success("✅ Streamlit Secrets から認証情報を読み込みました")
+                
+                spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab2")
+                sheet_name = st.text_input("シート名", value="apartments", key="gs_sheet_tab2")
+                
+                if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab2") and spreadsheet_id and credentials_json and sheet_name:
+                    success, message = upload_to_google_sheets(df_apt, spreadsheet_id, sheet_name, credentials_json)
+                    if success:
+                        st.success(f"✅ {message}")
+                    else:
+                        st.error(f"❌ {message}")
+            else:
+                st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
         else:
             st.warning("データが見つかりませんでした。HTMLを確認してください。")
 
@@ -582,6 +741,39 @@ with tab3:
                 file_name="villas.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            
+            # Google Sheets Upload
+            st.markdown("---")
+            st.markdown("#### 📊 Google Sheets にアップロード")
+            if GOOGLE_SHEETS_AVAILABLE:
+                credentials_json = None
+                try:
+                    if hasattr(st, 'secrets') and 'GOOGLE_CREDENTIALS' in st.secrets:
+                        credentials_json = st.secrets.GOOGLE_CREDENTIALS
+                except:
+                    pass
+                
+                if not credentials_json:
+                    credentials_input = st.text_area("Google Service Account JSON (省略可)", height=100, key="gs_creds_tab3")
+                    if credentials_input:
+                        try:
+                            credentials_json = json.loads(credentials_input)
+                        except:
+                            st.error("無効な JSON 形式です")
+                else:
+                    st.success("✅ Streamlit Secrets から認証情報を読み込みました")
+                
+                spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab3")
+                sheet_name = st.text_input("シート名", value="villas", key="gs_sheet_tab3")
+                
+                if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab3") and spreadsheet_id and credentials_json and sheet_name:
+                    success, message = upload_to_google_sheets(df_vil, spreadsheet_id, sheet_name, credentials_json)
+                    if success:
+                        st.success(f"✅ {message}")
+                    else:
+                        st.error(f"❌ {message}")
+            else:
+                st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
         else:
             st.warning("データが見つかりませんでした。HTMLを確認してください。")
 
