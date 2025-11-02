@@ -1,6 +1,7 @@
 # app.py
 import re
 import io
+import os
 from datetime import datetime
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -407,6 +408,36 @@ def parse_villa_html_to_df(html: str) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
+
+# Password protection (set your password here)
+# You can set password via Streamlit secrets or environment variable APP_PASSWORD
+# For Streamlit Cloud: Go to Settings -> Secrets -> Add: APP_PASSWORD = "your_password"
+# Or simply change "change_this_password" below to your desired password
+PASSWORD = "pass"  # ⚠️ CHANGE THIS to your password!
+try:
+    if hasattr(st, 'secrets') and 'APP_PASSWORD' in st.secrets:
+        PASSWORD = st.secrets.APP_PASSWORD
+    elif 'APP_PASSWORD' in os.environ:
+        PASSWORD = os.environ['APP_PASSWORD']
+except:
+    pass
+
+# Check if user is authenticated
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+# Password check
+if not st.session_state.authenticated:
+    st.title("🔒 REINS Extractor")
+    password = st.text_input("パスワードを入力してください", type="password")
+    if st.button("ログイン"):
+        if password == PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません")
+    st.stop()
+
 st.title("不動産テーブル：貼り付け → プレビュー → Excel")
 
 # Initialize session state

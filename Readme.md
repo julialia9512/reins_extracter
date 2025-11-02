@@ -42,6 +42,8 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Local Development
+
 1. Start the Streamlit app:
 ```bash
 streamlit run app.py
@@ -51,6 +53,36 @@ streamlit run app.py
    - Paste HTML content in the appropriate tab (Apartment or Villa)
    - Preview the extracted data
    - Download as Excel file
+
+### Hosting Online (Streamlit Community Cloud)
+
+To host this app online so you can access it without running locally:
+
+1. **Go to Streamlit Community Cloud**: Visit [share.streamlit.io](https://share.streamlit.io)
+
+2. **Sign in with GitHub**: Click "Sign in" and authorize with your GitHub account
+
+3. **Deploy your app**:
+   - Click "New app"
+   - Select your repository: `julialia9512/reins_extracter`
+   - Set Main file path to: `app.py`
+   - Click "Deploy"
+
+4. **Access your app**: Once deployed, you'll get a URL like:
+   ```
+   https://reins-extracter.streamlit.app
+   ```
+   You can access this URL from anywhere, anytime!
+
+5. **Set a password** (Recommended for privacy):
+   - After deployment, go to your app's Settings
+   - Click "Secrets"
+   - Add: `APP_PASSWORD = "your_secure_password"`
+   - Or edit `app.py` and change `PASSWORD = "change_this_password"` to your desired password
+
+**⚠️ Important**: By default, Streamlit Community Cloud apps are **publicly accessible**. Anyone with the URL can access them. The app includes password protection - make sure to set a secure password!
+
+**Note**: Your app will automatically update whenever you push changes to the `main` branch on GitHub.
 
 ## Features by Property Type
 
