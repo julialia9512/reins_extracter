@@ -419,7 +419,79 @@ def parse_villa_html_to_df(html: str) -> pd.DataFrame:
 # =========================
 # Google Sheets Integration
 # =========================
-def upload_to_google_sheets(df, spreadsheet_id, sheet_name, credentials_json=None, use_oauth=False):
+def extract_spreadsheet_id(url_or_id):
+    """Extract spreadsheet ID from URL or return ID if already provided"""
+    if not url_or_id:
+        return None
+    # If it's already just an ID (alphanumeric, ~43 chars)
+    if len(url_or_id) < 60 and url_or_id.isalnum():
+        return url_or_id
+    # Extract from URL
+    import re
+    # Pattern: /d/[SPREADSHEET_ID]/
+    match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url_or_id)
+    if match:
+        return match.group(1)
+    # Try without /spreadsheets/
+    match = re.search(r'/d/([a-zA-Z0-9-_]+)', url_or_id)
+    if match:
+        return match.group(1)
+    return None
+
+def create_new_spreadsheet(title, credentials_json=None):
+    """Create a new Google Spreadsheet"""
+    if not GOOGLE_SHEETS_AVAILABLE:
+        return None, "gspread library not installed", None
+    
+    try:
+        # Parse credentials
+        if credentials_json:
+            if isinstance(credentials_json, str):
+                try:
+                    creds_dict = json.loads(credentials_json)
+                except json.JSONDecodeError:
+                    return None, f"Invalid JSON format in credentials: {str(credentials_json)[:100]}", None
+            else:
+                creds_dict = credentials_json
+        else:
+            return None, "No credentials provided", None
+        
+        # Debug: check what keys are present (but don't expose sensitive data)
+        has_refresh = 'refresh_token' in creds_dict
+        has_private_key = 'private_key' in creds_dict
+        has_type = 'type' in creds_dict
+        
+        # Authenticate
+        if has_refresh:
+            # OAuth credentials
+            creds = google_creds.Credentials.from_authorized_user_info(creds_dict)
+            client = gspread.authorize(creds)
+        elif has_private_key:
+            # Service account credentials
+            creds = service_account.Credentials.from_service_account_info(creds_dict)
+            client = gspread.authorize(creds)
+        elif has_type:
+            # Check type field
+            cred_type = creds_dict.get('type')
+            if cred_type == 'authorized_user':
+                creds = google_creds.Credentials.from_authorized_user_info(creds_dict)
+                client = gspread.authorize(creds)
+            elif cred_type == 'service_account':
+                creds = service_account.Credentials.from_service_account_info(creds_dict)
+                client = gspread.authorize(creds)
+            else:
+                return None, f"Unable to determine credential type. Found type: {cred_type}. Expected keys: {list(creds_dict.keys())}", None
+        else:
+            return None, f"Unable to determine credential type. Available keys: {list(creds_dict.keys())[:10]}", None
+        
+        # Create spreadsheet
+        spreadsheet = client.create(title)
+        return spreadsheet.id, f"Created new spreadsheet: {spreadsheet.url}", spreadsheet.url
+    
+    except Exception as e:
+        return None, f"Error creating spreadsheet: {str(e)}", None
+
+def upload_to_google_sheets(df, spreadsheet_id, sheet_name, credentials_json=None, use_oauth=False, append=False):
     """
     Upload a pandas DataFrame to Google Sheets.
     
@@ -472,22 +544,64 @@ def upload_to_google_sheets(df, spreadsheet_id, sheet_name, credentials_json=Non
         # Open spreadsheet
         spreadsheet = client.open_by_key(spreadsheet_id)
         
+        # Prepare data for upload: replace NaN/None values with empty strings
+        # Copy dataframe to avoid modifying original
+        df_clean = df.copy()
+        # Replace NaN, None, and infinity values with empty strings
+        df_clean = df_clean.replace([float('nan'), float('inf'), float('-inf')], '')
+        df_clean = df_clean.fillna('')
+        
+        # Convert to list, replacing any remaining NaN values
+        def clean_value(val):
+            """Clean a value for JSON compatibility"""
+            import math
+            if val is None:
+                return ''
+            if isinstance(val, float):
+                if math.isnan(val) or math.isinf(val):
+                    return ''
+            return val
+        
+        # Clean all values in the dataframe
+        df_clean = df_clean.applymap(clean_value)
+        
+        # Convert to lists
+        headers = df_clean.columns.values.tolist()
+        rows = df_clean.values.tolist()
+        
         # Create or get sheet
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
-            # Clear existing data
-            worksheet.clear()
+            existing_rows = len(worksheet.get_all_values())
+            
+            if append:
+                # Append mode: add data after existing rows
+                if existing_rows == 0:
+                    # No data, add headers and data
+                    worksheet.update([headers] + rows)
+                    start_row = 1
+                else:
+                    # Has data, append new rows only
+                    worksheet.append_rows(rows)
+                    start_row = existing_rows + 1
+                
+                end_row = start_row + len(rows) - 1
+                message = f"✅ {len(rows)}行を追記しました (行 {start_row}〜{end_row})"
+            else:
+                # Replace mode: clear and write
+                worksheet.clear()
+                worksheet.update([headers] + rows)
+                message = f"✅ {len(rows)}行をアップロードしました"
         except gspread.exceptions.WorksheetNotFound:
             # Create new sheet
             worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=26)
+            worksheet.update([headers] + rows)
+            message = f"✅ 新しいシート '{sheet_name}' を作成し、{len(rows)}行をアップロードしました"
         
-        # Write data
-        worksheet.update([df.columns.values.tolist()] + df.values.tolist())
-        
-        return True, f"Successfully uploaded {len(df)} rows to Google Sheets!"
+        return True, message, spreadsheet.url
     
     except Exception as e:
-        return False, f"Error uploading to Google Sheets: {str(e)}"
+        return False, f"Error uploading to Google Sheets: {str(e)}", None
 
 # =========================
 # UI
@@ -618,32 +732,138 @@ with tab1:
                     pass
                 
                 if not credentials_json:
-                    st.info("Google Sheets を使用するには、Streamlit Secrets に GOOGLE_CREDENTIALS を設定するか、下記に JSON を貼り付けてください")
-                    credentials_input = st.text_area("Google Service Account JSON (省略可)", height=100, key="gs_creds_tab1")
-                    if credentials_input:
-                        try:
-                            credentials_json = json.loads(credentials_input)
-                        except:
-                            st.error("無効な JSON 形式です")
+                    st.info("💡 **Google Sheets を使用するには認証情報が必要です**\n\n- **推奨**: Streamlit Secrets に `GOOGLE_CREDENTIALS` を設定（一度設定すれば不要）\n- **オプション**: 下記に JSON を貼り付け（毎回必要）")
+                    with st.expander("🔑 認証情報を手動で入力する（オプション）", expanded=False):
+                        credentials_input = st.text_area("Google OAuth Token JSON", height=100, key="gs_creds_tab1",
+                                                         help="token.json の内容を貼り付けてください。Streamlit Secretsに設定することを推奨します。")
+                        if credentials_input:
+                            try:
+                                credentials_json = json.loads(credentials_input)
+                                st.success("✅ 認証情報を読み込みました")
+                            except json.JSONDecodeError as e:
+                                st.error(f"❌ 無効な JSON 形式です: {str(e)}")
+                            except Exception as e:
+                                st.error(f"❌ エラー: {str(e)}")
                 else:
-                    st.success("✅ Streamlit Secrets から認証情報を読み込みました")
+                    st.success("✅ Streamlit Secrets から認証情報を読み込みました（認証情報の入力は不要です）")
                 
-                spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab1", 
-                                              help="スプレッドシート URL から取得: https://docs.google.com/spreadsheets/d/[SPREADSHEET_ID]/edit")
+                # Check if we have an ID from previous creation
+                spreadsheet_id = None
+                if 'gs_id_tab1' in st.session_state and st.session_state.gs_id_tab1:
+                    spreadsheet_id = st.session_state.gs_id_tab1
+                    st.info(f"📋 使用中のスプレッドシート ID: `{spreadsheet_id[:20]}...`")
                 
-                if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab1") and spreadsheet_id and credentials_json:
-                    if not df_apt.empty:
-                        success, message = upload_to_google_sheets(df_apt, spreadsheet_id, "apartments", credentials_json)
-                        if success:
-                            st.success(f"✅ マンション/区分: {message}")
+                # Primary: Use existing spreadsheet URL
+                if not spreadsheet_id:
+                    spreadsheet_url_input = st.text_input("Google スプレッドシート URL または ID", key="gs_url_tab1", 
+                                                          help="既存のスプレッドシートURLを貼り付け、またはIDだけでもOK。ここに入力するとそのスプレッドシートに追記されます。")
+                    if spreadsheet_url_input:
+                        extracted_id = extract_spreadsheet_id(spreadsheet_url_input)
+                        if extracted_id:
+                            spreadsheet_id = extracted_id
+                            st.session_state.gs_id_tab1 = extracted_id
+                            st.success(f"✅ スプレッドシート ID を取得しました: {extracted_id[:20]}...")
                         else:
-                            st.error(f"❌ マンション/区分: {message}")
-                    if not df_vil.empty:
-                        success, message = upload_to_google_sheets(df_vil, spreadsheet_id, "villas", credentials_json)
-                        if success:
-                            st.success(f"✅ 戸建（ヴィラ）: {message}")
+                            st.error("❌ スプレッドシート ID を取得できませんでした。URL または ID を確認してください")
+                
+                # Upload to existing spreadsheet (primary workflow)
+                if spreadsheet_id:
+                    append_mode = st.checkbox("追記モード（既存データの下に追加）", value=True, key="append_tab1",
+                                             help="チェックを外すと既存データを置き換えます")
+                    
+                    upload_button = st.button("📊 Google Sheets にアップロード", key="gs_upload_tab1")
+                    
+                    if upload_button:
+                        # Debug: Show what we have
+                        debug_info = []
+                        debug_info.append(f"✅ スプレッドシート ID: {spreadsheet_id}")
+                        debug_info.append(f"✅ 認証情報: {'設定済み' if credentials_json else '未設定'}")
+                        debug_info.append(f"✅ マンション/区分データ: {len(df_apt)}行")
+                        debug_info.append(f"✅ 戸建（ヴィラ）データ: {len(df_vil)}行")
+                        st.info("\n".join(debug_info))
+                        
+                        if not spreadsheet_id:
+                            st.error("❌ スプレッドシート ID が設定されていません")
+                        elif not credentials_json:
+                            st.error("❌ **認証情報が設定されていません**")
+                            st.info("""
+**認証情報を設定する方法:**
+
+1. **Streamlit Secrets（推奨）**: 
+   - Streamlit Cloud → Settings → Secrets
+   - `GOOGLE_CREDENTIALS` に `token.json` の内容を貼り付け
+
+2. **手動入力（一時的）**:
+   - 上記の「🔑 認証情報を手動で入力する（オプション）」を展開
+   - `token.json` の内容を貼り付け
+                            """)
+                        elif df_apt.empty and df_vil.empty:
+                            st.warning("⚠️ アップロードするデータがありません")
                         else:
-                            st.error(f"❌ 戸建（ヴィラ）: {message}")
+                            with st.spinner("アップロード中..."):
+                                # Show progress
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                if not df_apt.empty:
+                                    status_text.text("📤 マンション/区分データをアップロード中...")
+                                    progress_bar.progress(30)
+                                    try:
+                                        success, message, spreadsheet_url = upload_to_google_sheets(df_apt, spreadsheet_id, "apartments", credentials_json, append=append_mode)
+                                        progress_bar.progress(50)
+                                        if success:
+                                            st.success(f"✅ **マンション/区分**: {message}")
+                                            if spreadsheet_url:
+                                                st.markdown(f"📊 **[スプレッドシートを開く]({spreadsheet_url})**")
+                                        else:
+                                            st.error(f"❌ **マンション/区分**: {message}")
+                                    except Exception as e:
+                                        st.error(f"❌ **マンション/区分 エラー**: {str(e)}")
+                                        import traceback
+                                        st.code(traceback.format_exc())
+                                
+                                if not df_vil.empty:
+                                    status_text.text("📤 戸建（ヴィラ）データをアップロード中...")
+                                    progress_bar.progress(70)
+                                    try:
+                                        success, message, spreadsheet_url = upload_to_google_sheets(df_vil, spreadsheet_id, "villas", credentials_json, append=append_mode)
+                                        progress_bar.progress(100)
+                                        if success:
+                                            st.success(f"✅ **戸建（ヴィラ）**: {message}")
+                                            if spreadsheet_url:
+                                                st.markdown(f"📊 **[スプレッドシートを開く]({spreadsheet_url})**")
+                                        else:
+                                            st.error(f"❌ **戸建（ヴィラ）**: {message}")
+                                    except Exception as e:
+                                        st.error(f"❌ **戸建（ヴィラ）エラー**: {str(e)}")
+                                        import traceback
+                                        st.code(traceback.format_exc())
+                                
+                                progress_bar.progress(100)
+                                status_text.text("✅ アップロード完了")
+                
+                # Optional: Create new spreadsheet (collapsible)
+                with st.expander("🆕 新規スプレッドシートを作成する（オプション）"):
+                    spreadsheet_title = st.text_input("スプレッドシート名", value="REINSデータ", key="spreadsheet_title_tab1")
+                    create_button = st.button("📊 新規スプレッドシート作成", key="create_spreadsheet_tab1")
+                    
+                    if create_button and spreadsheet_title and credentials_json:
+                        with st.spinner("スプレッドシートを作成中..."):
+                            new_id, message, spreadsheet_url = create_new_spreadsheet(spreadsheet_title, credentials_json)
+                            if new_id:
+                                st.session_state.gs_id_tab1 = new_id
+                                # Show success with link
+                                st.success(f"✅ スプレッドシート「{spreadsheet_title}」を作成しました！")
+                                if spreadsheet_url:
+                                    st.markdown(f"**📊 [スプレッドシートを開く]({spreadsheet_url})**")
+                                st.info(f"📋 **スプレッドシート ID**: `{new_id}`\n\nこのスプレッドシートにデータをアップロードできます。")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ **エラー**: {message}")
+                    elif create_button and not spreadsheet_title:
+                        st.warning("⚠️ スプレッドシート名を入力してください")
+                    elif create_button and not credentials_json:
+                        st.warning("⚠️ 認証情報が設定されていません。Streamlit Secretsに GOOGLE_CREDENTIALS を設定してください。")
             else:
                 st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
 
@@ -701,12 +921,17 @@ with tab2:
                 spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab2")
                 sheet_name = st.text_input("シート名", value="apartments", key="gs_sheet_tab2")
                 
+                append_mode_tab2 = st.checkbox("追記モード（既存データの下に追加）", value=True, key="append_tab2")
+                
                 if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab2") and spreadsheet_id and credentials_json and sheet_name:
-                    success, message = upload_to_google_sheets(df_apt, spreadsheet_id, sheet_name, credentials_json)
-                    if success:
-                        st.success(f"✅ {message}")
-                    else:
-                        st.error(f"❌ {message}")
+                    with st.spinner("アップロード中..."):
+                        success, message, spreadsheet_url = upload_to_google_sheets(df_apt, spreadsheet_id, sheet_name, credentials_json, append=append_mode_tab2)
+                        if success:
+                            st.success(f"✅ {message}")
+                            if spreadsheet_url:
+                                st.markdown(f"📊 **[スプレッドシートを開く]({spreadsheet_url})**")
+                        else:
+                            st.error(f"❌ {message}")
             else:
                 st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
         else:
@@ -766,12 +991,17 @@ with tab3:
                 spreadsheet_id = st.text_input("Google スプレッドシート ID", key="gs_id_tab3")
                 sheet_name = st.text_input("シート名", value="villas", key="gs_sheet_tab3")
                 
+                append_mode_tab3 = st.checkbox("追記モード（既存データの下に追加）", value=True, key="append_tab3")
+                
                 if st.button("📊 Google Sheets にアップロード", key="gs_upload_tab3") and spreadsheet_id and credentials_json and sheet_name:
-                    success, message = upload_to_google_sheets(df_vil, spreadsheet_id, sheet_name, credentials_json)
-                    if success:
-                        st.success(f"✅ {message}")
-                    else:
-                        st.error(f"❌ {message}")
+                    with st.spinner("アップロード中..."):
+                        success, message, spreadsheet_url = upload_to_google_sheets(df_vil, spreadsheet_id, sheet_name, credentials_json, append=append_mode_tab3)
+                        if success:
+                            st.success(f"✅ {message}")
+                            if spreadsheet_url:
+                                st.markdown(f"📊 **[スプレッドシートを開く]({spreadsheet_url})**")
+                        else:
+                            st.error(f"❌ {message}")
             else:
                 st.warning("Google Sheets ライブラリがインストールされていません。`pip install gspread google-auth` でインストールしてください。")
         else:

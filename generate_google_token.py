@@ -22,7 +22,12 @@ import json
 import os
 
 # Scopes needed for Google Sheets access
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+# spreadsheets: read/write sheets
+# drive: create new spreadsheets
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 
 def main():
     # Try to find credentials file
